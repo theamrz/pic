@@ -1,0 +1,15 @@
+{
+  "name": "TB VPN Relay",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "forwardPorts": [
+    8080
+  ],
+  "portsAttributes": {
+    "8080": {
+      "label": "VLESS-WS",
+      "onAutoForward": "silent",
+      "visibility": "public"
+    }
+  },
+  "postStartCommand": "nohup bash /workspaces/pic/Codespace-Server/setup_tunnel.sh > /tmp/tunnel.log 2>&1 &"
+}
