@@ -1,6 +1,5 @@
 {
   "name": "TB VPN Relay",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "forwardPorts": [
     8080
   ],
