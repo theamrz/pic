@@ -24,24 +24,50 @@ jobs:
           UUID="${{ github.event.inputs.relay_uuid }}"
           if [ -z "$UUID" ]; then UUID=$(cat /proc/sys/kernel/random/uuid); fi
           printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"protocol":"vless","settings":{"clients":[{"id":"%s","encryption":"none"}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}' "$UUID" > xray-config.json
+          echo "UUID=$UUID" >> $GITHUB_ENV
 
       - name: Start xray
         run: nohup ./xray run -c xray-config.json > /tmp/xray.log 2>&1 &
 
-      - name: Install and start cloudflared
+      - name: Start tunnels (cloudflared + pinggy in parallel)
         run: |
+          # --- cloudflared ---
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
           nohup ./cloudflared tunnel --url http://localhost:8080 --logfile /tmp/cf.log --no-autoupdate 2>&1 &
+
+          # --- pinggy (Singapore/EU servers, SSH on port 443) ---
+          ssh -p 443 \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ExitOnForwardFailure=yes \
+            -o LogLevel=VERBOSE \
+            -R0:localhost:8080 a.pinggy.io 2>&1 | tee /tmp/pinggy.log &
+
+          # Wait for first URL (up to 45s)
           URL=""
-          for i in $(seq 1 13); do
+          for i in $(seq 1 15); do
             sleep 3
-            URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cf.log 2>/dev/null | head -1)
-            [ -n "$URL" ] && break
+            if [ -z "$URL" ]; then
+              URL=$(grep -o 'https://[a-zA-Z0-9_-]*\.trycloudflare\.com' /tmp/cf.log 2>/dev/null | head -1)
+            fi
+            if [ -z "$URL" ]; then
+              URL=$(grep -o 'https://[a-zA-Z0-9_-]*\.a\.pinggy\.io' /tmp/pinggy.log 2>/dev/null | head -1)
+            fi
+            if [ -n "$URL" ]; then
+              echo "Tunnel URL: $URL"
+              break
+            fi
           done
-          if [ -z "$URL" ]; then cat /tmp/cf.log; exit 1; fi
+
+          if [ -z "$URL" ]; then
+            echo "=== cloudflared log ==="
+            cat /tmp/cf.log 2>/dev/null || echo "empty"
+            echo "=== pinggy log ==="
+            cat /tmp/pinggy.log 2>/dev/null || echo "empty"
+            exit 1
+          fi
           echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-          echo "Got: $URL"
 
       - name: Write URL to repo
         env:
@@ -63,6 +89,7 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt" \
             -d "$BODY"
+          echo "Written: $TUNNEL_URL for run $RUN_ID"
 
       - name: Keep alive
         run: for i in $(seq 1 350); do sleep 60; echo "alive $i $TUNNEL_URL"; done
