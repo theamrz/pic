@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       relay_uuid:
-        description: VLESS UUID
+        description: 'VLESS UUID'
         required: false
-        default: ""
+        default: ''
 jobs:
   relay:
     runs-on: ubuntu-latest
@@ -23,40 +23,50 @@ jobs:
           UUID="${{ github.event.inputs.relay_uuid }}"
           [ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid)
           echo "RELAY_UUID=$UUID" >> $GITHUB_ENV
-          printf "{"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"%s","level":0}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}" "$UUID" > config.json
-          echo "config.json:" && cat config.json
+          printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"%s","level":0}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}' "$UUID" > config.json
+          echo "xray config written for UUID=$UUID"
 
       - name: Start xray
         run: |
           ./xray run -config config.json &
           sleep 2
-          echo "xray started"
+          echo "xray started on :8080"
 
       - name: Start localhost.run tunnel
         run: |
-          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30             -R 80:localhost:8080 nokey@localhost.run > /tmp/tun.log 2>&1 &
-          sleep 10
-          cat /tmp/tun.log
-          URL=$(grep -oE "https://[a-zA-Z0-9_-]+\.lhr\.life" /tmp/tun.log | head -1)
-          if [ -z "$URL" ]; then
-            URL=$(grep -oE "https://[a-zA-Z0-9_-]+\.localhost\.run" /tmp/tun.log | head -1)
-          fi
+          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R 80:localhost:8080 nokey@localhost.run > /tmp/tun.log 2>&1 &
+          sleep 12
+          cat /tmp/tun.log || true
+          URL=$(grep -oE 'https://[a-zA-Z0-9_-]+\.lhr\.life' /tmp/tun.log | head -1)
+          [ -z "$URL" ] && URL=$(grep -oE 'https://[a-zA-Z0-9_-]+\.localhost\.run' /tmp/tun.log | head -1)
           echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-          echo "=== Relay: $URL ==="
+          echo "=== Relay ready: $URL ==="
 
       - name: Write relay URL to repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
         run: |
-          RUN_ID="${{ github.run_id }}"
           URL="$TUNNEL_URL"
+          FPATH="relay-urls/${RUN_ID}.txt"
           B64=$(printf "%s" "$URL" | base64 -w0)
-          SHA=$(curl -sf             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"             "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt"             | python3 -c "import sys,json; print(json.load(sys.stdin).get("sha",""))" 2>/dev/null || echo "")
+          SHA=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/${FPATH}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
           if [ -n "$SHA" ]; then
-            BODY="{"message":"relay url","content":"$B64","sha":"$SHA"}"
+            BODY="{\"message\":\"relay url\",\"content\":\"$B64\",\"sha\":\"$SHA\"}"
           else
-            BODY="{"message":"relay url","content":"$B64"}"
+            BODY="{\"message\":\"relay url\",\"content\":\"$B64\"}"
           fi
-          curl -s -X PUT             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"             -H "Content-Type: application/json"             -d "$BODY"             "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt"
-          echo "URL written to repo: relay-urls/${RUN_ID}.txt"
+          curl -sf -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "https://api.github.com/repos/${REPO}/contents/${FPATH}"
+          echo "URL written to repo: $FPATH"
 
       - name: Keep alive
         run: |
