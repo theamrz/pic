@@ -1,0 +1,190 @@
+name: tbvpn-fetch
+# Fetch HTTP requests on behalf of a client behind heavy filtering.
+# Client writes requests to fetch-requests/{id}.json
+# This workflow polls every 2-3 seconds, fetches each URL, and writes the response
+# to fetch-responses/{id}.json — encrypted with the client's UUID as a key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep polling (max 350 min)"
+        default: "300"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests pycryptodome
+
+      - name: Fetch loop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DURATION: ${{ inputs.duration_minutes }}
+        run: |
+          cat > /tmp/runner.py <<'PYEOF'
+          import os, sys, json, time, base64, requests, traceback, hashlib
+          from Crypto.Cipher import AES
+          from Crypto.Util.Padding import pad, unpad
+
+          GH_TOKEN  = os.environ["GH_TOKEN"]
+          REPO      = os.environ["REPO"]
+          DURATION  = int(os.environ.get("DURATION", "300"))
+          API       = f"https://api.github.com/repos/{REPO}"
+          HEADERS   = {
+              "Authorization": f"Bearer {GH_TOKEN}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          REQ_DIR   = "fetch-requests"
+          RES_DIR   = "fetch-responses"
+          MAX_BYTES = 900_000  # max ~900KB per response (GitHub blob limit ~1MB base64-decoded)
+
+          def aes_key(passphrase: str) -> bytes:
+              return hashlib.sha256(passphrase.encode("utf-8")).digest()
+
+          def aes_decrypt(b64_payload: str, passphrase: str) -> bytes:
+              raw = base64.b64decode(b64_payload)
+              iv, ct = raw[:16], raw[16:]
+              c = AES.new(aes_key(passphrase), AES.MODE_CBC, iv)
+              return unpad(c.decrypt(ct), 16)
+
+          def aes_encrypt(data: bytes, passphrase: str) -> str:
+              iv = os.urandom(16)
+              c = AES.new(aes_key(passphrase), AES.MODE_CBC, iv)
+              ct = c.encrypt(pad(data, 16))
+              return base64.b64encode(iv + ct).decode("ascii")
+
+          def list_requests():
+              r = requests.get(f"{API}/contents/{REQ_DIR}", headers=HEADERS, timeout=15)
+              if r.status_code == 404:
+                  return []
+              if r.status_code != 200:
+                  print(f"list error {r.status_code}: {r.text[:200]}")
+                  return []
+              return [f for f in r.json() if f["name"].endswith(".json")]
+
+          def get_file(path):
+              r = requests.get(f"{API}/contents/{path}", headers=HEADERS, timeout=15)
+              if r.status_code != 200:
+                  return None, None
+              j = r.json()
+              return base64.b64decode(j["content"]), j["sha"]
+
+          def put_file(path, content_bytes, message="fetch"):
+              # delete existing first (overwrite path with new sha if present)
+              r = requests.get(f"{API}/contents/{path}", headers=HEADERS, timeout=15)
+              sha = r.json().get("sha") if r.status_code == 200 else None
+              body = {
+                  "message": message,
+                  "content": base64.b64encode(content_bytes).decode("ascii"),
+              }
+              if sha:
+                  body["sha"] = sha
+              r = requests.put(f"{API}/contents/{path}", headers=HEADERS, json=body, timeout=20)
+              return r.status_code in (200, 201)
+
+          def delete_file(path, sha):
+              body = {"message": "consume", "sha": sha}
+              requests.delete(f"{API}/contents/{path}", headers=HEADERS, json=body, timeout=15)
+
+          def do_fetch(req: dict) -> dict:
+              method  = (req.get("method") or "GET").upper()
+              url     = req["url"]
+              headers = req.get("headers") or {}
+              body    = req.get("body")
+              if body and isinstance(body, str):
+                  body = base64.b64decode(body)
+              try:
+                  r = requests.request(
+                      method, url,
+                      headers=headers,
+                      data=body,
+                      timeout=req.get("timeout", 25),
+                      allow_redirects=req.get("allow_redirects", True),
+                      stream=False,
+                  )
+                  raw = r.content
+                  truncated = False
+                  if len(raw) > MAX_BYTES:
+                      raw = raw[:MAX_BYTES]
+                      truncated = True
+                  return {
+                      "ok": True,
+                      "status": r.status_code,
+                      "headers": dict(r.headers),
+                      "body_b64": base64.b64encode(raw).decode("ascii"),
+                      "final_url": r.url,
+                      "truncated": truncated,
+                      "size": len(r.content),
+                  }
+              except Exception as e:
+                  return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+          end_time = time.time() + DURATION * 60
+          print(f"[fetch] starting loop for {DURATION} min")
+          empty_polls = 0
+          while time.time() < end_time:
+              try:
+                  files = list_requests()
+                  if not files:
+                      empty_polls += 1
+                      time.sleep(min(3 + empty_polls // 5, 8))
+                      continue
+                  empty_polls = 0
+                  print(f"[fetch] {len(files)} request(s) pending")
+                  for f in files:
+                      path = f["path"]
+                      data, sha = get_file(path)
+                      if not data:
+                          continue
+                      try:
+                          envelope = json.loads(data.decode("utf-8"))
+                          uuid = envelope["uuid"]
+                          payload_b64 = envelope["payload"]
+                          plain = aes_decrypt(payload_b64, uuid)
+                          req = json.loads(plain.decode("utf-8"))
+                          req_id = req.get("id") or f["name"].rsplit(".", 1)[0]
+                      except Exception as e:
+                          print(f"[fetch] bad request {path}: {e}")
+                          delete_file(path, sha)
+                          continue
+
+                      print(f"[fetch] -> {req.get('method','GET')} {req.get('url','')[:80]}")
+                      result = do_fetch(req)
+                      result["id"] = req_id
+
+                      try:
+                          enc = aes_encrypt(json.dumps(result).encode("utf-8"), uuid)
+                          out = json.dumps({"uuid_hint": uuid[:8], "payload": enc}).encode("utf-8")
+                          if put_file(f"{RES_DIR}/{req_id}.json", out, f"resp {req_id[:8]}"):
+                              delete_file(path, sha)
+                              print(f"[fetch] <- {result.get('status','ERR')} ({result.get('size',0)}B)")
+                          else:
+                              print(f"[fetch] put failed for {req_id}")
+                      except Exception as e:
+                          print(f"[fetch] write error: {e}")
+                          traceback.print_exc()
+                  time.sleep(2)
+              except Exception as e:
+                  print(f"[fetch] loop error: {e}")
+                  traceback.print_exc()
+                  time.sleep(5)
+          print("[fetch] duration elapsed")
+          PYEOF
+          python3 /tmp/runner.py
