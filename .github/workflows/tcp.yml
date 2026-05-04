@@ -1,0 +1,242 @@
+name: tbvpn-tcp-polling
+# Emergency TCP relay over GitHub Contents API.
+# Client writes encrypted frames to tcp-in/{stream}/{seq}.json.
+# Worker opens TCP sockets and writes encrypted frames to tcp-out/{stream}/{seq}.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep polling (max 350 min)"
+        default: "120"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  tcp-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests pycryptodome
+
+      - name: TCP polling loop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DURATION: ${{ inputs.duration_minutes }}
+        run: |
+          cat > /tmp/tcp_worker.py <<'PYEOF'
+          import base64
+          import hashlib
+          import json
+          import os
+          import select
+          import socket
+          import time
+          import traceback
+
+          import requests
+          from Crypto.Cipher import AES
+          from Crypto.Util.Padding import pad, unpad
+
+          GH_TOKEN = os.environ["GH_TOKEN"]
+          REPO = os.environ["REPO"]
+          DURATION = int(os.environ.get("DURATION", "120"))
+          API = f"https://api.github.com/repos/{REPO}"
+          HEADERS = {
+              "Authorization": f"Bearer {GH_TOKEN}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "tbvpn-tcp-worker/1.0",
+          }
+          IN_ROOT = "tcp-in"
+          OUT_ROOT = "tcp-out"
+          MAX_READ = 24576
+
+          streams = {}
+          sockets = {}
+
+          def aes_key(passphrase: str) -> bytes:
+              return hashlib.sha256(passphrase.encode("utf-8")).digest()
+
+          def aes_decrypt(b64_payload: str, passphrase: str) -> bytes:
+              raw = base64.b64decode(b64_payload)
+              iv, ct = raw[:16], raw[16:]
+              return unpad(AES.new(aes_key(passphrase), AES.MODE_CBC, iv).decrypt(ct), 16)
+
+          def aes_encrypt(data: bytes, passphrase: str) -> str:
+              iv = os.urandom(16)
+              ct = AES.new(aes_key(passphrase), AES.MODE_CBC, iv).encrypt(pad(data, 16))
+              return base64.b64encode(iv + ct).decode("ascii")
+
+          def api(method, path, **kwargs):
+              return requests.request(method, f"{API}/contents/{path}", headers=HEADERS, timeout=20, **kwargs)
+
+          def list_dir(path):
+              r = api("GET", path)
+              if r.status_code == 404:
+                  return []
+              if r.status_code != 200:
+                  print(f"[api] list {path} -> {r.status_code}: {r.text[:160]}")
+                  return []
+              data = r.json()
+              if not isinstance(data, list):
+                  return []
+              return data
+
+          def get_file(path):
+              r = api("GET", path)
+              if r.status_code != 200:
+                  return None, None
+              j = r.json()
+              return base64.b64decode(j["content"]), j["sha"]
+
+          def put_file(path, raw, message):
+              body = {
+                  "message": message,
+                  "content": base64.b64encode(raw).decode("ascii"),
+              }
+              r = api("PUT", path, json=body)
+              if r.status_code not in (200, 201):
+                  print(f"[api] put {path} -> {r.status_code}: {r.text[:200]}")
+                  return False
+              return True
+
+          def delete_file(path, sha):
+              try:
+                  api("DELETE", path, json={"message": "consume", "sha": sha})
+              except Exception:
+                  pass
+
+          def close_stream(sid, reason="close"):
+              st = streams.pop(sid, None)
+              s = sockets.pop(sid, None)
+              if s:
+                  try:
+                      s.close()
+                  except Exception:
+                      pass
+              if st:
+                  print(f"[stream] {sid[:8]} closed: {reason}")
+
+          def put_out(sid, frame):
+              st = streams.get(sid)
+              if not st:
+                  return False
+              seq = st["out_seq"]
+              st["out_seq"] += 1
+              payload = aes_encrypt(json.dumps(frame, separators=(",", ":")).encode(), st["passphrase"])
+              env = json.dumps({"uuid_hint": st["passphrase"][:8], "payload": payload}, separators=(",", ":")).encode()
+              return put_file(f"{OUT_ROOT}/{sid}/{seq:06d}.json", env, f"tcp out {sid[:8]} {seq}")
+
+          def handle_frame(frame, passphrase):
+              sid = frame.get("sid")
+              typ = frame.get("type")
+              if not sid or not typ:
+                  return
+              if typ == "open":
+                  host = frame.get("host", "")
+                  port = int(frame.get("port", 0))
+                  print(f"[open] {sid[:8]} -> {host}:{port}")
+                  streams[sid] = {"passphrase": passphrase, "out_seq": 1, "created": time.time()}
+                  try:
+                      s = socket.create_connection((host, port), timeout=15)
+                      s.setblocking(False)
+                      sockets[sid] = s
+                      put_out(sid, {"sid": sid, "type": "open_ok"})
+                  except Exception as e:
+                      put_out(sid, {"sid": sid, "type": "error", "message": f"connect failed: {type(e).__name__}: {e}"})
+                      close_stream(sid, "open failed")
+              elif typ == "data":
+                  s = sockets.get(sid)
+                  if not s:
+                      return
+                  try:
+                      chunk = base64.b64decode(frame.get("data_b64", ""))
+                      if chunk:
+                          s.sendall(chunk)
+                  except Exception as e:
+                      put_out(sid, {"sid": sid, "type": "error", "message": f"send failed: {type(e).__name__}: {e}"})
+                      close_stream(sid, "send failed")
+              elif typ == "close":
+                  close_stream(sid, "client close")
+
+          def process_inputs():
+              dirs = [x for x in list_dir(IN_ROOT) if x.get("type") == "dir"]
+              for d in dirs:
+                  sid = d["name"]
+                  files = sorted([x for x in list_dir(f"{IN_ROOT}/{sid}") if x.get("name", "").endswith(".json")], key=lambda x: x["name"])
+                  for f in files[:20]:
+                      path = f["path"]
+                      raw, sha = get_file(path)
+                      if not raw:
+                          continue
+                      try:
+                          env = json.loads(raw.decode())
+                          passphrase = env["uuid"]
+                          frame = json.loads(aes_decrypt(env["payload"], passphrase).decode())
+                          handle_frame(frame, passphrase)
+                      except Exception as e:
+                          print(f"[bad] {path}: {type(e).__name__}: {e}")
+                          traceback.print_exc()
+                      finally:
+                          if sha:
+                              delete_file(path, sha)
+
+          def pump_sockets():
+              if not sockets:
+                  return
+              items = list(sockets.items())
+              try:
+                  readable, _, errored = select.select([s for _, s in items], [], [s for _, s in items], 0)
+              except Exception:
+                  return
+              by_sock = {s: sid for sid, s in items}
+              for s in errored:
+                  sid = by_sock.get(s)
+                  if sid:
+                      put_out(sid, {"sid": sid, "type": "error", "message": "socket error"})
+                      close_stream(sid, "socket error")
+              for s in readable:
+                  sid = by_sock.get(s)
+                  if not sid:
+                      continue
+                  try:
+                      data = s.recv(MAX_READ)
+                      if data:
+                          put_out(sid, {"sid": sid, "type": "data", "data_b64": base64.b64encode(data).decode("ascii")})
+                      else:
+                          put_out(sid, {"sid": sid, "type": "close"})
+                          close_stream(sid, "remote eof")
+                  except BlockingIOError:
+                      pass
+                  except Exception as e:
+                      put_out(sid, {"sid": sid, "type": "error", "message": f"recv failed: {type(e).__name__}: {e}"})
+                      close_stream(sid, "recv failed")
+
+          end = time.time() + min(max(DURATION, 1), 350) * 60
+          print(f"[tcp] polling loop started for {DURATION} min")
+          tick = 0
+          while time.time() < end:
+              try:
+                  process_inputs()
+                  pump_sockets()
+                  tick += 1
+                  if tick % 30 == 0:
+                      print(f"[tcp] alive streams={len(streams)}")
+                  time.sleep(0.35 if streams else 1.5)
+              except Exception as e:
+                  print(f"[loop] {type(e).__name__}: {e}")
+                  traceback.print_exc()
+                  time.sleep(2)
+          print("[tcp] duration elapsed")
+          PYEOF
+          python3 /tmp/tcp_worker.py
