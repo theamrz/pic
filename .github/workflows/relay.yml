@@ -15,20 +15,15 @@ jobs:
         run: |
           curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
           unzip xray.zip xray && chmod +x xray
-
       - name: Write xray config
         run: |
           UUID="${{ github.event.inputs.relay_uuid }}"
           [ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid)
           echo "RELAY_UUID=$UUID" >> $GITHUB_ENV
-          cat > config.json <<EOF
-          {"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"$UUID","level":0}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}
-          EOF
-
+          printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"%s","level":0}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}' "$UUID" > config.json
       - name: Start xray
         run: ./xray run -config config.json &
-
-      - name: Start cloudflared tunnel
+      - name: Start cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
@@ -38,15 +33,13 @@ jobs:
           echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
           echo "$URL" > relay-url.txt
           echo "=== Relay: $URL ==="
-
       - name: Upload relay-url artifact
         uses: actions/upload-artifact@v4
         with:
           name: relay-url
           path: relay-url.txt
           retention-days: 1
-
       - name: Keep alive
         run: |
-          echo "UUID=$RELAY_UUID | URL=$TUNNEL_URL"
-          for i in $(seq 1 300); do sleep 60; echo "alive $i/300 — $TUNNEL_URL"; done
+          echo "UUID=$RELAY_UUID  URL=$TUNNEL_URL"
+          for i in $(seq 1 350); do sleep 60; echo "alive $i/350"; done
