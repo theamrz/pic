@@ -29,67 +29,105 @@ jobs:
       - name: Start xray
         run: nohup ./xray run -c xray-config.json > /tmp/xray.log 2>&1 &
 
-      - name: Start tunnels (cloudflared + pinggy in parallel)
+      - name: Install tunnel binaries
         run: |
-          # --- cloudflared ---
+          # cloudflared
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
-          nohup ./cloudflared tunnel --url http://localhost:8080 --logfile /tmp/cf.log --no-autoupdate 2>&1 &
+          # localtunnel
+          npm install -g localtunnel 2>&1 | tail -3
+          # bore (rust-based)
+          wget -q https://github.com/ekzhang/bore/releases/latest/download/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz -O bore.tar.gz || echo "bore dl failed"
+          tar -xzf bore.tar.gz 2>/dev/null && chmod +x bore || echo "no bore"
 
-          # --- pinggy (Singapore/EU servers, SSH on port 443) ---
-          ssh -p 443 \
-            -o StrictHostKeyChecking=no \
-            -o ServerAliveInterval=30 \
-            -o ExitOnForwardFailure=yes \
-            -o LogLevel=VERBOSE \
-            -R0:localhost:8080 a.pinggy.io 2>&1 | tee /tmp/pinggy.log &
+      - name: Start ALL tunnels in parallel
+        run: |
+          # cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8080 --logfile /tmp/cf.log --no-autoupdate > /tmp/cf.out 2>&1 &
+          echo "cloudflared started"
 
-          # Wait for first URL (up to 45s)
-          URL=""
-          for i in $(seq 1 15); do
-            sleep 3
-            if [ -z "$URL" ]; then
-              URL=$(grep -o 'https://[a-zA-Z0-9_-]*\.trycloudflare\.com' /tmp/cf.log 2>/dev/null | head -1)
-            fi
-            if [ -z "$URL" ]; then
-              URL=$(grep -o 'https://[a-zA-Z0-9_-]*\.a\.pinggy\.io' /tmp/pinggy.log 2>/dev/null | head -1)
-            fi
-            if [ -n "$URL" ]; then
-              echo "Tunnel URL: $URL"
-              break
-            fi
+          # serveo (Germany SSH)
+          ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R80:localhost:8080 serveo.net > /tmp/serveo.log 2>&1 &
+          echo "serveo started"
+
+          # pinggy (Singapore SSH)
+          ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R0:localhost:8080 a.pinggy.io > /tmp/pinggy.log 2>&1 &
+          echo "pinggy started"
+
+          # localtunnel
+          nohup lt --port 8080 > /tmp/lt.log 2>&1 &
+          echo "localtunnel started"
+
+          # Wait & collect URLs
+          sleep 8
+          declare -a URLS=()
+
+          for round in 1 2 3 4 5; do
+            sleep 4
+            # cloudflared
+            CF=$(grep -hoE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log /tmp/cf.out 2>/dev/null | head -1)
+            # serveo
+            SV=$(grep -hoE 'https://[a-zA-Z0-9-]+\.serveo\.net' /tmp/serveo.log 2>/dev/null | head -1)
+            # pinggy
+            PG=$(grep -hoE 'https://[a-zA-Z0-9_-]+\.a\.pinggy\.link' /tmp/pinggy.log 2>/dev/null | head -1)
+            [ -z "$PG" ] && PG=$(grep -hoE 'https://[a-zA-Z0-9_-]+\.a\.free\.pinggy\.link' /tmp/pinggy.log 2>/dev/null | head -1)
+            # localtunnel
+            LT=$(grep -hoE 'https://[a-zA-Z0-9-]+\.loca\.lt' /tmp/lt.log 2>/dev/null | head -1)
+
+            URLS=()
+            [ -n "$CF" ] && URLS+=("$CF")
+            [ -n "$SV" ] && URLS+=("$SV")
+            [ -n "$PG" ] && URLS+=("$PG")
+            [ -n "$LT" ] && URLS+=("$LT")
+
+            echo "Round $round - found ${#URLS[@]} tunnels: ${URLS[@]}"
+            if [ ${#URLS[@]} -ge 2 ]; then break; fi
           done
 
-          if [ -z "$URL" ]; then
-            echo "=== cloudflared log ==="
-            cat /tmp/cf.log 2>/dev/null || echo "empty"
-            echo "=== pinggy log ==="
-            cat /tmp/pinggy.log 2>/dev/null || echo "empty"
+          if [ ${#URLS[@]} -eq 0 ]; then
+            echo "=== ALL LOGS ==="
+            for f in cf.log cf.out serveo.log pinggy.log lt.log; do
+              echo "--- /tmp/$f ---"
+              cat /tmp/$f 2>/dev/null | head -20
+            done
             exit 1
           fi
-          echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
 
-      - name: Write URL to repo
+          # Build JSON
+          JSON='{"uuid":"'$UUID'","tunnels":['
+          first=1
+          for u in "${URLS[@]}"; do
+            if [ $first -eq 1 ]; then first=0; else JSON+=','; fi
+            JSON+='"'$u'"'
+          done
+          JSON+=']}'
+          echo "$JSON" > /tmp/relay.json
+          echo "Final JSON: $JSON"
+          echo "RELAY_JSON_B64=$(echo -n $JSON | base64 -w0)" >> $GITHUB_ENV
+
+      - name: Write JSON to repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_ID="${{ github.run_id }}"
-          ENCODED=$(echo -n "$TUNNEL_URL" | base64 -w0)
           SHA_FILE=$(curl -sf --resolve "api.github.com:443:140.82.121.5" \
             -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.json" \
             | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
           if [ -n "$SHA_FILE" ]; then
-            BODY=$(printf '{"message":"relay url","content":"%s","sha":"%s"}' "$ENCODED" "$SHA_FILE")
+            BODY=$(printf '{"message":"relay urls","content":"%s","sha":"%s"}' "$RELAY_JSON_B64" "$SHA_FILE")
           else
-            BODY=$(printf '{"message":"relay url","content":"%s"}' "$ENCODED")
+            BODY=$(printf '{"message":"relay urls","content":"%s"}' "$RELAY_JSON_B64")
           fi
           curl -s -X PUT --resolve "api.github.com:443:140.82.121.5" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/json" \
-            "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt" \
-            -d "$BODY"
-          echo "Written: $TUNNEL_URL for run $RUN_ID"
+            "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.json" \
+            -d "$BODY" | head -c 200
+          echo ""
+          echo "Written JSON for run $RUN_ID"
 
       - name: Keep alive
-        run: for i in $(seq 1 350); do sleep 60; echo "alive $i $TUNNEL_URL"; done
+        run: for i in $(seq 1 350); do sleep 60; echo "alive $i"; done
