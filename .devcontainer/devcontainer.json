@@ -1,7 +1,7 @@
 {
   "name": "tbvpn-relay",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-  "postCreateCommand": "curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip && unzip -o /tmp/xray.zip xray -d /usr/local/bin && chmod +x /usr/local/bin/xray",
+  "postCreateCommand": "curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip && unzip -o /tmp/xray.zip xray -d /usr/local/bin && chmod +x /usr/local/bin/xray && echo 'xray ready'",
   "forwardPorts": [8080],
-  "features": {}
+  "portsAttributes": { "8080": { "label": "VLESS relay", "onAutoForward": "silent" } }
 }
