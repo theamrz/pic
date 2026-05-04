@@ -15,61 +15,54 @@ jobs:
     steps:
       - name: Download xray
         run: |
-          curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
-          unzip xray.zip xray && chmod +x xray
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip xray
+          chmod +x xray
 
       - name: Write xray config
         run: |
           UUID="${{ github.event.inputs.relay_uuid }}"
-          [ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid)
-          echo "RELAY_UUID=$UUID" >> $GITHUB_ENV
-          printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"%s","level":0}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}' "$UUID" > config.json
-          echo "xray config written for UUID=$UUID"
+          if [ -z "$UUID" ]; then UUID=$(cat /proc/sys/kernel/random/uuid); fi
+          printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":8080,"protocol":"vless","settings":{"clients":[{"id":"%s","encryption":"none"}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],"outbounds":[{"protocol":"freedom"}]}' "$UUID" > xray-config.json
 
       - name: Start xray
-        run: |
-          ./xray run -config config.json &
-          sleep 2
-          echo "xray started on :8080"
+        run: nohup ./xray run -c xray-config.json > /tmp/xray.log 2>&1 &
 
-      - name: Start localhost.run tunnel
+      - name: Install and start cloudflared
         run: |
-          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-            -R 80:localhost:8080 nokey@localhost.run > /tmp/tun.log 2>&1 &
-          sleep 12
-          cat /tmp/tun.log || true
-          URL=$(grep -oE 'https://[a-zA-Z0-9_-]+\.lhr\.life' /tmp/tun.log | head -1)
-          [ -z "$URL" ] && URL=$(grep -oE 'https://[a-zA-Z0-9_-]+\.localhost\.run' /tmp/tun.log | head -1)
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8080 --logfile /tmp/cf.log --no-autoupdate 2>&1 &
+          URL=""
+          for i in $(seq 1 13); do
+            sleep 3
+            URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cf.log 2>/dev/null | head -1)
+            [ -n "$URL" ] && break
+          done
+          if [ -z "$URL" ]; then cat /tmp/cf.log; exit 1; fi
           echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-          echo "=== Relay ready: $URL ==="
+          echo "Got: $URL"
 
-      - name: Write relay URL to repo
+      - name: Write URL to repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ github.run_id }}
-          REPO: ${{ github.repository }}
         run: |
-          URL="$TUNNEL_URL"
-          FPATH="relay-urls/${RUN_ID}.txt"
-          B64=$(printf "%s" "$URL" | base64 -w0)
-          SHA=$(curl -sf \
+          RUN_ID="${{ github.run_id }}"
+          ENCODED=$(echo -n "$TUNNEL_URL" | base64 -w0)
+          SHA_FILE=$(curl -sf --resolve "api.github.com:443:140.82.121.5" \
             -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${REPO}/contents/${FPATH}" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
-          if [ -n "$SHA" ]; then
-            BODY="{\"message\":\"relay url\",\"content\":\"$B64\",\"sha\":\"$SHA\"}"
+            "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
+          if [ -n "$SHA_FILE" ]; then
+            BODY=$(printf '{"message":"relay url","content":"%s","sha":"%s"}' "$ENCODED" "$SHA_FILE")
           else
-            BODY="{\"message\":\"relay url\",\"content\":\"$B64\"}"
+            BODY=$(printf '{"message":"relay url","content":"%s"}' "$ENCODED")
           fi
-          curl -sf -X PUT \
+          curl -s -X PUT --resolve "api.github.com:443:140.82.121.5" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "$BODY" \
-            "https://api.github.com/repos/${REPO}/contents/${FPATH}"
-          echo "URL written to repo: $FPATH"
+            "https://api.github.com/repos/${{ github.repository }}/contents/relay-urls/${RUN_ID}.txt" \
+            -d "$BODY"
 
       - name: Keep alive
-        run: |
-          echo "UUID=$RELAY_UUID"
-          echo "URL=$TUNNEL_URL"
-          for i in $(seq 1 350); do sleep 60; echo "alive $i/350 -- $TUNNEL_URL"; done
+        run: for i in $(seq 1 350); do sleep 60; echo "alive $i $TUNNEL_URL"; done
